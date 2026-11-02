@@ -1,0 +1,3 @@
+target/
+# Local transcripts of third-party videos (not redistributed)
+transcript*.md
