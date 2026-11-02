@@ -75,8 +75,10 @@ pub struct State {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Fate {
-    /// Index of the ejected star.
+    /// Index of the ejected star; the other two leave as a bound pair.
     Ejected(usize),
+    /// All three stars unbound (only possible with positive total energy).
+    Ionized,
     /// Nobody left before the cutoff (or the step cap was hit).
     Undecided,
 }
@@ -89,6 +91,22 @@ pub struct Outcome {
     pub steps: u32,
     /// |E - E0| / |E0| at the end of the run.
     pub energy_err: f64,
+    /// Energy of the remaining pair when a star was ejected (NaN otherwise).
+    pub pair_energy: f64,
+}
+
+/// Step size, distances and cutoff for one run.
+#[derive(Clone, Copy, Debug)]
+pub struct RunScales {
+    /// Regularised step before the tight-pair shrink.
+    pub h: f64,
+    /// Separations below this shrink the step as sqrt(r_min / r_ref).
+    pub r_ref: f64,
+    /// Escape distance.
+    pub r_far: f64,
+    pub t_max: f64,
+    /// Unit for `Outcome::t_cr_units` (crossing time, or binary period for scatterings).
+    pub t_unit: f64,
 }
 
 fn add(a: V2, b: V2) -> V2 {
@@ -258,9 +276,10 @@ pub fn scales(m: &[f64; 3], e0: f64) -> (f64, f64) {
     (t_cr, pair_sum / e0.abs())
 }
 
-/// Returns the star that has escaped: positive energy relative to the other two, moving
-/// away from them, beyond `r_far_abs`, and leaving a bound pair behind.
-pub fn escaped(s: &State, m: &[f64; 3], r_far_abs: f64) -> Option<usize> {
+/// A star beyond `r_far_abs`, receding, with positive energy relative to the other two:
+/// `Ejected(k)` if the pair left behind is bound (with that pair's energy), `Ionized` if
+/// it isn't. Must match `escaped` in the shader.
+pub fn escaped(s: &State, m: &[f64; 3], r_far_abs: f64) -> Option<(Fate, f64)> {
     let (x, v) = com_frame(s, m);
     for k in 0..3 {
         let (i, j) = pair(k);
@@ -278,8 +297,20 @@ pub fn escaped(s: &State, m: &[f64; 3], r_far_abs: f64) -> Option<usize> {
         let dp = sub(x[j], x[i]);
         let dv = sub(v[j], v[i]);
         let e_pair = 0.5 * (m[i] * m[j] / mp) * dot(dv, dv) - m[i] * m[j] / len(dp);
-        if e_k > 0.0 && e_pair < 0.0 {
-            return Some(k);
+        if e_k <= 0.0 {
+            continue;
+        }
+        if e_pair < 0.0 {
+            return Some((Fate::Ejected(k), e_pair));
+        }
+        // Pair unbound too: ionisation only once every pair is unbound and far apart,
+        // otherwise this is an exchange still in progress.
+        let two_body = |a: usize, b: usize| {
+            let (dx, dv) = (sub(x[b], x[a]), sub(v[b], v[a]));
+            0.5 * (m[a] * m[b] / (m[a] + m[b])) * dot(dv, dv) - m[a] * m[b] / len(dx)
+        };
+        if len(dp) > r_far_abs && two_body(k, i) >= 0.0 && two_body(k, j) >= 0.0 {
+            return Some((Fate::Ionized, e_pair));
         }
     }
     None
@@ -314,26 +345,36 @@ pub fn initial_state(cfg: &Config, c: V2) -> State {
     from_rest([cfg.pos_a, cfg.pos_b, c], &cfg.masses)
 }
 
-/// Runs one system to completion. `trace`, if given, receives (time, absolute positions)
-/// after every step.
-pub fn simulate_state(
+/// Scales for the fate-map experiment, from the system's energy.
+pub fn fate_scales(cfg: &Config, e0: f64) -> RunScales {
+    let (t_cr, r_v) = scales(&cfg.masses, e0);
+    RunScales {
+        h: cfg.eta * e0.abs() * t_cr,
+        r_ref: r_v,
+        r_far: cfg.r_far * r_v,
+        t_max: cfg.t_max_cr * t_cr,
+        t_unit: t_cr,
+    }
+}
+
+/// Runs one system to completion with the given scales. `trace`, if given, receives
+/// (time, absolute positions) after every step.
+pub fn simulate_run(
     cfg: &Config,
     mut s: State,
+    sc: RunScales,
     mut trace: Option<&mut Vec<(f64, [V2; 3])>>,
 ) -> Outcome {
     let m = &cfg.masses;
     let e0 = energy(&s, m);
-    let (t_cr, r_v) = scales(m, e0);
-    let t_max = cfg.t_max_cr * t_cr;
-    let r_far_abs = cfg.r_far * r_v;
-    let h = cfg.eta * e0.abs() * t_cr;
     let mut steps = 0u32;
     let mut fate = Fate::Undecided;
-    while s.t < t_max && steps < cfg.max_steps {
+    let mut pair_energy = f64::NAN;
+    while s.t < sc.t_max && steps < cfg.max_steps {
         let h_eff = if cfg.resolve_binaries {
-            h * (min_separation(&s, m) / r_v).sqrt().min(1.0)
+            sc.h * (min_separation(&s, m) / sc.r_ref).sqrt().min(1.0)
         } else {
-            h
+            sc.h
         };
         step(&mut s, m, h_eff, -e0);
         maybe_switch(&mut s, m);
@@ -342,23 +383,124 @@ pub fn simulate_state(
             tr.push((s.t, absolute_positions(&s, m)));
         }
         if steps % ESCAPE_CHECK_EVERY == 0 {
-            if let Some(k) = escaped(&s, m, r_far_abs) {
-                fate = Fate::Ejected(k);
+            if let Some((f, e_pair)) = escaped(&s, m, sc.r_far) {
+                fate = f;
+                pair_energy = e_pair;
                 break;
             }
         }
     }
     Outcome {
         fate,
-        t_cr_units: s.t / t_cr,
+        t_cr_units: s.t / sc.t_unit,
         steps,
         energy_err: ((energy(&s, m) - e0) / e0).abs(),
+        pair_energy,
     }
+}
+
+/// Runs one fate-map system to completion.
+pub fn simulate_state(
+    cfg: &Config,
+    s: State,
+    trace: Option<&mut Vec<(f64, [V2; 3])>>,
+) -> Outcome {
+    let sc = fate_scales(cfg, energy(&s, &cfg.masses));
+    simulate_run(cfg, s, sc, trace)
 }
 
 /// Runs the pixel experiment: stars 0 and 1 fixed, star 2 at `c`, all at rest.
 pub fn simulate(cfg: &Config, c: V2) -> Outcome {
     simulate_state(cfg, initial_state(cfg, c), None)
+}
+
+// ---------------------------------------------------------------------------------------
+// Binary-single scattering: stars 0 and 1 form a binary with semi-major axis 1, star 2
+// comes in from far away. Mirrors `init_scatter` in the shader.
+
+/// Start and escape distance, in binary semi-major axes.
+pub const SCATTER_R0: f64 = 20.0;
+/// Time allowed for a resonant encounter, in binary dynamical times sqrt(a^3 / m_b),
+/// on top of the fly-in and fly-out.
+pub const SCATTER_RESONANCE_TIME: f64 = 2000.0;
+
+/// One cell of the scattering table.
+#[derive(Clone, Copy, Debug)]
+pub struct Encounter {
+    /// Speed at infinity in units of the critical speed (total energy 0 at 1).
+    pub v_ratio: f64,
+    /// Pericentre of the incoming orbit (binary treated as a point), in semi-major axes.
+    pub rp: f64,
+    /// Binary eccentricity; negative = drawn from the thermal distribution f(e) = 2e.
+    pub ecc: f64,
+}
+
+/// Speed at infinity for which the total energy is zero (a = 1).
+pub fn critical_speed(m: &[f64; 3]) -> f64 {
+    let mb = m[0] + m[1];
+    let mu3 = m[2] * mb / (mb + m[2]);
+    (m[0] * m[1] / mu3).sqrt()
+}
+
+/// Initial state, scales and binary energy for one random realisation of `enc`.
+/// `rand` holds four uniform numbers in [0, 1): mean anomaly, orientation, sense of
+/// rotation, eccentricity.
+pub fn scatter_state(cfg: &Config, enc: &Encounter, rand: [f64; 4]) -> (State, RunScales, f64) {
+    let m = &cfg.masses;
+    let mb = m[0] + m[1];
+    let mt = mb + m[2];
+    let e = if enc.ecc < 0.0 { rand[3].sqrt() } else { enc.ecc }.min(0.99);
+    // Kepler's equation for the eccentric anomaly.
+    let mean = std::f64::consts::TAU * rand[0];
+    let mut ea = mean;
+    for _ in 0..12 {
+        ea -= (ea - e * ea.sin() - mean) / (1.0 - e * ea.cos());
+    }
+    let f = mb.sqrt() / (1.0 - e * ea.cos());
+    let root = (1.0 - e * e).sqrt();
+    let sense = if rand[2] < 0.5 { 1.0 } else { -1.0 };
+    let p = [ea.cos() - e, sense * root * ea.sin()];
+    let w = [-ea.sin() * f, sense * root * ea.cos() * f];
+    let (so, co) = (std::f64::consts::TAU * rand[1]).sin_cos();
+    let rot = |v: V2| [co * v[0] - so * v[1], so * v[0] + co * v[1]];
+
+    let v_inf = (enc.v_ratio * critical_speed(m)).max(1e-3);
+    let b = enc.rp * (1.0 + 2.0 * mt / (enc.rp * v_inf * v_inf)).sqrt();
+    let r0 = SCATTER_R0;
+    let v_t = b * v_inf / r0;
+    let v_r = -(v_inf * v_inf + 2.0 * mt / r0 - v_t * v_t).max(0.0).sqrt();
+    let s = State {
+        k: 2,
+        q: rot(p),
+        u: rot(w),
+        qq: [-r0, 0.0],
+        uu: [-v_r, -v_t],
+        t: 0.0,
+        com: [0.0; 2],
+    };
+    let e_b0 = 0.5 * (m[0] * m[1] / mb) * dot(s.u, s.u) - m[0] * m[1] / len(s.q);
+    let t_b = (1.0 / mb).sqrt();
+    let t_ff = std::f64::consts::FRAC_PI_2 * (r0.powi(3) / (2.0 * mt)).sqrt();
+    let sc = RunScales {
+        h: cfg.eta * m[0] * m[1] * t_b,
+        r_ref: 1.0,
+        r_far: r0,
+        t_max: 4.0 * t_ff + SCATTER_RESONANCE_TIME * t_b,
+        t_unit: std::f64::consts::TAU * t_b,
+    };
+    (s, sc, e_b0)
+}
+
+/// Outcome of one scattering, plus the fractional change of the binary's binding
+/// energy (positive = the binary hardened).
+pub fn simulate_encounter(cfg: &Config, enc: &Encounter, rand: [f64; 4]) -> (Outcome, f64) {
+    let (s, sc, e_b0) = scatter_state(cfg, enc, rand);
+    let out = simulate_run(cfg, s, sc, None);
+    let de = match out.fate {
+        Fate::Ejected(_) => (e_b0 - out.pair_energy) / e_b0.abs(),
+        _ => f64::NAN,
+    };
+    (out, de)
 }
 
 #[cfg(test)]
@@ -432,6 +574,43 @@ mod tests {
                 assert_eq!(a.fate, b.fate, "({x},{y})");
             }
         }
+    }
+
+    fn lcg_uniforms(seed: &mut u64) -> [f64; 4] {
+        std::array::from_fn(|_| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (*seed >> 11) as f64 / (1u64 << 53) as f64
+        })
+    }
+
+    #[test]
+    fn hard_binaries_never_ionize_and_harden_on_average() {
+        let cfg = Config::default();
+        let enc = Encounter { v_ratio: 0.3, rp: 0.5, ecc: 0.0 };
+        let mut seed = 7;
+        let mut de_sum = 0.0;
+        let mut n = 0;
+        for _ in 0..60 {
+            let (out, de) = simulate_encounter(&cfg, &enc, lcg_uniforms(&mut seed));
+            assert_ne!(out.fate, Fate::Ionized, "{out:?}");
+            assert!(out.energy_err < 1e-3, "{out:?}");
+            if de.is_finite() {
+                de_sum += de;
+                n += 1;
+            }
+        }
+        assert!(n > 40 && de_sum / n as f64 > 0.0, "mean dE {} over {n}", de_sum / n as f64);
+    }
+
+    #[test]
+    fn soft_head_on_encounters_ionize() {
+        let cfg = Config::default();
+        let enc = Encounter { v_ratio: 3.0, rp: 0.2, ecc: 0.0 };
+        let mut seed = 11;
+        let ionized = (0..60)
+            .filter(|_| simulate_encounter(&cfg, &enc, lcg_uniforms(&mut seed)).0.fate == Fate::Ionized)
+            .count();
+        assert!(ionized > 6, "ionized {ionized}/60");
     }
 
     // Off the symmetry axes: with star 2 exactly on x = 0 or y = 0, stars collide head-on.

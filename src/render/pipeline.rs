@@ -21,7 +21,7 @@ use crate::params::{FractalUniform, GpuParams, TEX_SIZE};
 pub const SHADER_ASSET_PATH: &str = "shaders/threebody.wgsl";
 pub const OUTPUT_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 /// Bytes per simulated system (`struct Pixel`).
-const PIXEL_BYTES: u64 = 48;
+const PIXEL_BYTES: u64 = 64;
 /// Two lanes (normal + sensitivity rerun) at the finest level.
 pub const STATES_BYTES: u64 = 2 * (TEX_SIZE as u64) * (TEX_SIZE as u64) * PIXEL_BYTES;
 
@@ -33,11 +33,12 @@ pub struct FractalPipeline {
     pub advance: CachedComputePipelineId,
     pub clear_stats: CachedComputePipelineId,
     pub shade: CachedComputePipelineId,
+    pub shade_scatter: CachedComputePipelineId,
 }
 
 impl FractalPipeline {
-    pub fn all(&self) -> [CachedComputePipelineId; 5] {
-        [self.reproject, self.init, self.advance, self.clear_stats, self.shade]
+    pub fn all(&self) -> [CachedComputePipelineId; 6] {
+        [self.reproject, self.init, self.advance, self.clear_stats, self.shade, self.shade_scatter]
     }
 }
 
@@ -85,6 +86,7 @@ pub fn init_pipeline(
         advance: queue("advance"),
         clear_stats: queue("clear_stats"),
         shade: queue("shade"),
+        shade_scatter: queue("shade_scatter"),
         layout,
     };
     commands.insert_resource(pipeline);

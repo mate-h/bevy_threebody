@@ -10,6 +10,10 @@
 //   advance     - every frame: advance each running pixel by up to `steps_per_frame` steps
 //   clear_stats - every frame: zero the stats buffer
 //   shade       - every frame: colour finished pixels, accumulate stats
+//
+// Scattering mode (params.mode == 1) reuses init/advance with a different setup: every
+// thread is one random binary-single encounter for one cell of an outcome table, and
+// starts a new random encounter as soon as one finishes. shade_scatter colours the cells.
 
 struct Params {
     masses: vec4<f32>,
@@ -35,9 +39,19 @@ struct Params {
     sensitivity: u32,
     front: u32,
     done: u32,
+    // 0 = fate map, 1 = scattering table.
+    mode: u32,
+    // Binary eccentricity for scatterings; negative = thermal.
+    scatter_ecc: f32,
+    // Scattering table: cells per side, encounters running per cell, axis ranges.
+    cells: u32,
+    samples: u32,
+    v_max: f32,
+    rp_max: f32,
+    seed_base: u32,
 }
 
-// 48 bytes per simulated system. The state is in Jacobi coordinates about the closest
+// 64 bytes per simulated system. The state is in Jacobi coordinates about the closest
 // pair (see src/physics_cpu.rs): close separations are stored directly, which is what
 // lets f32 get through near-collisions.
 struct Pixel {
@@ -46,9 +60,13 @@ struct Pixel {
     t: f32,
     t_max: f32,
     e0: f32,
-    // bits 0-1 status (0 running, 1 ejected, 2 undecided), bits 2-3 fate,
-    // bits 4-5 third star k, bits 6.. steps
+    // bits 0-1 status (0 running, 1 finished, 2 undecided), bits 2-3 fate (0-2 = star
+    // ejected, 3 = ionised), bits 4-5 third star k, bits 6.. steps
     info: u32,
+    // Scattering mode: encounter counter (random seed) and initial binary energy.
+    trial: u32,
+    e_b0: f32,
+    _pad: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -56,8 +74,9 @@ struct Pixel {
 @group(0) @binding(1) var<storage, read_write> states: array<Pixel>;
 // Header (see STATS_* below) followed by a 64x64 grid of [fate0, fate1, fate2, undecided].
 @group(0) @binding(2) var<storage, read_write> stats: array<atomic<u32>>;
-// Per-pixel `info` of lane 0 at the current level, for GPU-vs-CPU verification.
-@group(0) @binding(3) var<storage, read_write> fates: array<u32>;
+// Fate mode: per-pixel `info` of lane 0 at the current level, for GPU-vs-CPU checks.
+// Scattering mode: ACC_STRIDE counters per table cell (see ACC_*).
+@group(0) @binding(3) var<storage, read_write> fates: array<atomic<u32>>;
 @group(0) @binding(4) var dst: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var src: texture_2d<f32>;
 
@@ -67,6 +86,23 @@ const STATUS_RUNNING: u32 = 0u;
 const STATUS_EJECTED: u32 = 1u;
 const STATUS_UNDECIDED: u32 = 2u;
 const MAX_STEPS_FIELD: u32 = 0x03ffffffu;
+const FATE_IONIZED: u32 = 3u;
+const NO_ESCAPE: u32 = 4u;
+
+const MODE_SCATTER: u32 = 1u;
+const ACC_STRIDE: u32 = 8u;
+const ACC_TRIALS: u32 = 0u;
+const ACC_FLYBY: u32 = 1u;
+const ACC_EXCHANGE: u32 = 2u;
+const ACC_IONIZED: u32 = 3u;
+const ACC_UNDECIDED: u32 = 4u;
+const ACC_DE_SUM: u32 = 5u; // i32, fractional binding-energy change x DE_SCALE
+const ACC_DE_COUNT: u32 = 6u;
+const DE_SCALE: f32 = 1000.0;
+// Must match SCATTER_R0 / SCATTER_RESONANCE_TIME in src/physics_cpu.rs.
+const SCATTER_R0: f32 = 20.0;
+const SCATTER_RESONANCE_TIME: f32 = 2000.0;
+const TAU: f32 = 6.283185307179586;
 
 const STATS_GENERATION: u32 = 0u;
 const STATS_LEVEL: u32 = 1u;
@@ -233,9 +269,17 @@ fn virial_radius(e0: f32) -> f32 {
     return (m.x * m.y + m.x * m.z + m.y * m.z) / abs(e0);
 }
 
-// Index of the escaping star, or 3 if none: positive energy relative to the other two,
-// moving away, beyond r_far_abs, and leaving a bound pair behind.
-fn escaped(s: Jac, r_far_abs: f32) -> u32 {
+fn two_body_energy(x: array<vec2<f32>, 3>, v: array<vec2<f32>, 3>, a: u32, b: u32) -> f32 {
+    let ma = mass(a);
+    let mb = mass(b);
+    let dv = v[b] - v[a];
+    return 0.5 * (ma * mb / (ma + mb)) * dot(dv, dv) - ma * mb / length(x[b] - x[a]);
+}
+
+// A star beyond r_far_abs, receding, with positive energy relative to the other two:
+// returns its index if the pair left behind is bound (writing that pair's energy to
+// e_pair_out), FATE_IONIZED once every pair is unbound and far apart, else NO_ESCAPE.
+fn escaped(s: Jac, r_far_abs: f32, e_pair_out: ptr<function, f32>) -> u32 {
     let i0 = (s.k + 1u) % 3u;
     let j0 = (s.k + 2u) % 3u;
     let mp0 = mass(i0) + mass(j0);
@@ -264,13 +308,20 @@ fn escaped(s: Jac, r_far_abs: f32) -> u32 {
             continue;
         }
         let e_k = 0.5 * (mk * mp / (mk + mp)) * dot(w, w) - mk * mp / dist;
-        let dv = v[j] - v[i];
-        let e_pair = 0.5 * (mi * mj / mp) * dot(dv, dv) - mi * mj / length(x[j] - x[i]);
-        if e_k > 0.0 && e_pair < 0.0 {
+        if e_k <= 0.0 {
+            continue;
+        }
+        let e_pair = two_body_energy(x, v, i, j);
+        if e_pair < 0.0 {
+            *e_pair_out = e_pair;
             return k;
         }
+        if length(x[j] - x[i]) > r_far_abs && two_body_energy(x, v, k, i) >= 0.0
+            && two_body_energy(x, v, k, j) >= 0.0 {
+            return FATE_IONIZED;
+        }
     }
-    return 3u;
+    return NO_ESCAPE;
 }
 
 fn load(p: Pixel) -> Jac {
@@ -290,18 +341,36 @@ fn lane_count() -> u32 {
 }
 
 // ---------------------------------------------------------------------------------------
-// Entry points
+// Setups
 
-@compute @workgroup_size(8, 8, 1)
-fn init(@builtin(global_invocation_id) id: vec3<u32>) {
-    let res = params.res;
-    if id.x >= res || id.y >= res || id.z >= lane_count() {
-        return;
+struct Scales {
+    h: f32,
+    r_ref: f32,
+    r_far: f32,
+}
+
+// Mirrors fate_scales / scatter_state in src/physics_cpu.rs.
+fn run_scales(p: Pixel, eta: f32) -> Scales {
+    if params.mode == MODE_SCATTER {
+        let mb = mass(0u) + mass(1u);
+        return Scales(eta * mass(0u) * mass(1u) * sqrt(1.0 / mb), 1.0, SCATTER_R0);
     }
+    let t_cr = p.t_max / params.t_max_cr;
+    let r_v = virial_radius(p.e0);
+    return Scales(eta * abs(p.e0) * t_cr, r_v, params.r_far * r_v);
+}
+
+fn store_jac(p: ptr<function, Pixel>, s: Jac) {
+    (*p).q_u = vec4<f32>(s.q, s.u);
+    (*p).qq_uu = vec4<f32>(s.qq, s.uu);
+    (*p).t = s.t;
+}
+
+fn init_fate(id: vec2<u32>, res: u32) -> Pixel {
     var x: array<vec2<f32>, 3>;
     x[0] = params.pos_a;
     x[1] = params.pos_b;
-    x[2] = pixel_world(id.xy, res);
+    x[2] = pixel_world(id, res);
     // Third star = the one opposite the shortest side.
     let d0 = length(x[2] - x[1]);
     let d1 = length(x[2] - x[0]);
@@ -325,13 +394,143 @@ fn init(@builtin(global_invocation_id) id: vec3<u32>) {
     let e0 = -potential(s);
 
     var p: Pixel;
-    p.q_u = vec4<f32>(s.q, s.u);
-    p.qq_uu = vec4<f32>(s.qq, s.uu);
-    p.t = 0.0;
+    store_jac(&p, s);
     p.t_max = params.t_max_cr * crossing_time(e0);
     p.e0 = e0;
     p.info = (k << 4u) | STATUS_RUNNING;
-    states[id.z * res * res + id.y * res + id.x] = p;
+    return p;
+}
+
+fn pcg(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn unit_float(h: u32) -> f32 {
+    return f32(h >> 8u) / 16777216.0;
+}
+
+fn critical_speed() -> f32 {
+    let mb = mass(0u) + mass(1u);
+    let mu3 = mass(2u) * mb / (mb + mass(2u));
+    return sqrt(mass(0u) * mass(1u) / mu3);
+}
+
+// Table cell of system `idx`: x = v_inf / v_c (left to right), y = r_p / a (bottom to top).
+fn scatter_cell(idx: u32) -> vec2<u32> {
+    let cell = idx / params.samples;
+    return vec2<u32>(cell % params.cells, cell / params.cells);
+}
+
+fn cell_params(c: vec2<u32>) -> vec2<f32> {
+    let n = f32(params.cells);
+    return vec2<f32>(
+        (f32(c.x) + 0.5) / n * params.v_max,
+        (n - f32(c.y) - 0.5) / n * params.rp_max,
+    );
+}
+
+// One random binary-single encounter. Mirrors scatter_state in src/physics_cpu.rs.
+fn init_scatter(idx: u32, trial: u32) -> Pixel {
+    let vr = cell_params(scatter_cell(idx));
+    let m0 = mass(0u);
+    let m1 = mass(1u);
+    let mb = m0 + m1;
+    let mt = mb + mass(2u);
+
+    var h = pcg(idx ^ pcg(trial + params.seed_base));
+    let r_mean = unit_float(h);
+    h = pcg(h);
+    let r_orient = unit_float(h);
+    h = pcg(h);
+    let r_sense = unit_float(h);
+    h = pcg(h);
+    let r_ecc = unit_float(h);
+
+    var e = params.scatter_ecc;
+    if e < 0.0 {
+        e = sqrt(r_ecc);
+    }
+    e = min(e, 0.99);
+    let mean = TAU * r_mean;
+    var ea = mean;
+    for (var n = 0; n < 12; n++) {
+        ea -= (ea - e * sin(ea) - mean) / (1.0 - e * cos(ea));
+    }
+    let f = sqrt(mb) / (1.0 - e * cos(ea));
+    let root = sqrt(1.0 - e * e);
+    let sense = select(-1.0, 1.0, r_sense < 0.5);
+    let pos = vec2<f32>(cos(ea) - e, sense * root * sin(ea));
+    let vel = vec2<f32>(-sin(ea) * f, sense * root * cos(ea) * f);
+    let so = sin(TAU * r_orient);
+    let co = cos(TAU * r_orient);
+    let rot = mat2x2<f32>(co, so, -so, co);
+
+    let v_inf = max(vr.x * critical_speed(), 1e-3);
+    let rp = vr.y;
+    let b = rp * sqrt(1.0 + 2.0 * mt / (rp * v_inf * v_inf));
+    let v_t = b * v_inf / SCATTER_R0;
+    let v_r = -sqrt(max(v_inf * v_inf + 2.0 * mt / SCATTER_R0 - v_t * v_t, 0.0));
+
+    var s: Jac;
+    s.k = 2u;
+    s.t = 0.0;
+    s.q = rot * pos;
+    s.u = rot * vel;
+    s.qq = vec2<f32>(-SCATTER_R0, 0.0);
+    s.uu = vec2<f32>(-v_r, -v_t);
+
+    let t_b = sqrt(1.0 / mb);
+    let t_ff = 0.25 * TAU * sqrt(SCATTER_R0 * SCATTER_R0 * SCATTER_R0 / (2.0 * mt));
+    var p: Pixel;
+    store_jac(&p, s);
+    p.t_max = 4.0 * t_ff + SCATTER_RESONANCE_TIME * t_b;
+    p.e0 = energy(s);
+    p.e_b0 = 0.5 * (m0 * m1 / mb) * dot(s.u, s.u) - m0 * m1 / length(s.q);
+    p.trial = trial;
+    p.info = (2u << 4u) | STATUS_RUNNING;
+    return p;
+}
+
+// Adds a finished encounter to its cell's counters.
+fn accumulate(idx: u32, status: u32, fate: u32, de: f32) {
+    let c = scatter_cell(idx);
+    let base = (c.y * params.cells + c.x) * ACC_STRIDE;
+    atomicAdd(&fates[base + ACC_TRIALS], 1u);
+    if status == STATUS_UNDECIDED {
+        atomicAdd(&fates[base + ACC_UNDECIDED], 1u);
+    } else if fate == FATE_IONIZED {
+        atomicAdd(&fates[base + ACC_IONIZED], 1u);
+    } else {
+        // Star 2 came in: if it leaves again it's a flyby, otherwise an exchange.
+        atomicAdd(&fates[base + select(ACC_EXCHANGE, ACC_FLYBY, fate == 2u)], 1u);
+        let fixed = i32(round(clamp(de, -20.0, 20.0) * DE_SCALE));
+        atomicAdd(&fates[base + ACC_DE_SUM], bitcast<u32>(fixed));
+        atomicAdd(&fates[base + ACC_DE_COUNT], 1u);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Entry points
+
+@compute @workgroup_size(8, 8, 1)
+fn init(@builtin(global_invocation_id) id: vec3<u32>) {
+    let res = params.res;
+    if id.x >= res || id.y >= res || id.z >= lane_count() {
+        return;
+    }
+    let idx = id.z * res * res + id.y * res + id.x;
+    if params.mode == MODE_SCATTER {
+        // Clear the counters; slot 7 of cell 0 tags them with the generation so stale
+        // readbacks can be told apart.
+        if idx < params.cells * params.cells * ACC_STRIDE {
+            atomicStore(&fates[idx], select(0u, params.generation, idx == 7u));
+        }
+        states[idx] = init_scatter(idx, 0u);
+    } else {
+        states[idx] = init_fate(id.xy, res);
+    }
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -346,25 +545,23 @@ fn advance(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let eta = select(params.eta, params.eta_b, id.z == 1u);
-    let t_cr = p.t_max / params.t_max_cr;
-    let r_v = virial_radius(p.e0);
-    let r_far_abs = params.r_far * r_v;
-    let h = eta * abs(p.e0) * t_cr;
+    let sc = run_scales(p, eta);
     let b = -p.e0;
 
     var s = load(p);
     var steps = p.info >> 6u;
     var status = STATUS_RUNNING;
     var fate = 0u;
+    var e_pair = 0.0;
     for (var n = 0u; n < params.steps_per_frame; n++) {
         // Shrink the step for tight pairs so they keep a fixed number of steps per orbit.
-        let h_eff = h * min(1.0, sqrt(min_separation(s) / r_v));
+        let h_eff = sc.h * min(1.0, sqrt(min_separation(s) / sc.r_ref));
         yoshida(&s, h_eff, b);
         maybe_switch(&s);
         steps += 1u;
         if steps % ESCAPE_CHECK_EVERY == 0u {
-            let e = escaped(s, r_far_abs);
-            if e < 3u {
+            let e = escaped(s, sc.r_far, &e_pair);
+            if e != NO_ESCAPE {
                 status = STATUS_EJECTED;
                 fate = e;
                 break;
@@ -376,9 +573,12 @@ fn advance(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    p.q_u = vec4<f32>(s.q, s.u);
-    p.qq_uu = vec4<f32>(s.qq, s.uu);
-    p.t = s.t;
+    if params.mode == MODE_SCATTER && status != STATUS_RUNNING {
+        accumulate(idx, status, fate, (p.e_b0 - e_pair) / abs(p.e_b0));
+        states[idx] = init_scatter(idx, p.trial + 1u);
+        return;
+    }
+    store_jac(&p, s);
     p.info = (min(steps, MAX_STEPS_FIELD) << 6u) | (s.k << 4u) | (fate << 2u) | status;
     states[idx] = p;
 }
@@ -482,7 +682,7 @@ fn shade(
         let p = states[idx];
         let status = p.info & 3u;
         let fate = (p.info >> 2u) & 3u;
-        fates[idx] = p.info;
+        atomicStore(&fates[idx], p.info);
 
         var running = status == STATUS_RUNNING;
         var disagree = false;
@@ -523,6 +723,45 @@ fn shade(
     workgroupBarrier();
     if li < 6u {
         atomicAdd(&stats[STATS_COUNTS + li], atomicLoad(&wg_counts[li]));
+    }
+}
+
+// Colours each table cell from its counters: outcome mix (blue flyby, gold exchange,
+// red ionisation, dark unresolved) or, in colour mode 1, the mean change of the binary's
+// binding energy (green = hardened, magenta = softened).
+@compute @workgroup_size(8, 8, 1)
+fn shade_scatter(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = params.cells;
+    if id.x >= n || id.y >= n {
+        return;
+    }
+    let base = (id.y * n + id.x) * ACC_STRIDE;
+    let trials = atomicLoad(&fates[base + ACC_TRIALS]);
+    var color = vec3<f32>(0.02);
+    if trials > 0u {
+        let inv = 1.0 / f32(trials);
+        if params.color_mode == 1u {
+            let count = atomicLoad(&fates[base + ACC_DE_COUNT]);
+            if count > 0u {
+                let mean = f32(bitcast<i32>(atomicLoad(&fates[base + ACC_DE_SUM])))
+                    / DE_SCALE / f32(count);
+                let t = pow(clamp(abs(mean) / 0.5, 0.0, 1.0), 0.6);
+                let hue = select(vec3<f32>(0.85, 0.2, 0.85), vec3<f32>(0.25, 0.9, 0.35), mean > 0.0);
+                color = srgb_to_linear(mix(vec3<f32>(0.08), hue, t));
+            }
+        } else {
+            let fly = f32(atomicLoad(&fates[base + ACC_FLYBY])) * inv;
+            let exch = f32(atomicLoad(&fates[base + ACC_EXCHANGE])) * inv;
+            let ion = f32(atomicLoad(&fates[base + ACC_IONIZED])) * inv;
+            color = fly * fate_color(1u) + exch * fate_color(0u) + ion * fate_color(2u)
+                + (1.0 - fly - exch - ion) * UNDECIDED;
+        }
+    }
+    let block = params.tex_size / n;
+    for (var dy = 0u; dy < block; dy++) {
+        for (var dx = 0u; dx < block; dx++) {
+            textureStore(dst, vec2<u32>(id.x * block + dx, id.y * block + dy), vec4<f32>(color, 1.0));
+        }
     }
 }
 

@@ -1,9 +1,12 @@
 //! Text overlay: view, progress, fate percentages, inspector and verification results.
 
-use bevy::prelude::*;
+use bevy::{prelude::*, window::PrimaryWindow};
 
 use crate::inspector::{Inspector, describe};
 use crate::params::{LEVELS, Settings, SimState};
+use crate::input::{DisplaySize, cursor_texel, texel_cell};
+use crate::params::{ColorMode, ECC_PRESETS, SCATTER_CELLS};
+use crate::scatter::{ScatterTable, ScatterVerify};
 use crate::stats::{GpuStats, Verify};
 
 #[derive(Component)]
@@ -19,7 +22,8 @@ const HELP: &str = "\
 wheel zoom  |  drag pan  |  right-click inspect orbit  |  esc close
 space zoom 5x into boundary  |  backspace zoom out 5x  |  T auto tour (to 625x)  |  R reset
 1 fate  |  2 ejection time  |  3 energy error  |  4 steps  |  5 sensitivity  |  S toggle 2nd run
-[ ] eta  |  - = t_max  |  M masses  |  V verify vs CPU  |  P screenshot  |  H hide help";
+[ ] eta  |  - = t_max  |  M masses  |  V verify vs CPU  |  P screenshot  |  H hide help
+Tab scattering table (1 outcomes, 2 binary energy change, E eccentricity, right-click replay)";
 
 pub fn setup_ui(mut commands: Commands) {
     let font = TextFont { font_size: FontSize::Px(13.0), ..default() };
@@ -61,10 +65,58 @@ pub fn update_ui(
     inspector: Res<Inspector>,
     help: Res<ShowHelp>,
     time: Res<Time<Real>>,
+    table: Res<ScatterTable>,
+    scatter_verify: Res<ScatterVerify>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    display: Res<DisplaySize>,
     mut status: Single<&mut Text, (With<StatusText>, Without<HelpText>)>,
     mut help_vis: Single<&mut Visibility, With<HelpText>>,
 ) {
     **help_vis = if help.0 { Visibility::Inherited } else { Visibility::Hidden };
+
+    if settings.scattering() {
+        let m = settings.physics.masses;
+        let ecc = ECC_PRESETS[settings.ecc_preset];
+        let mut lines = vec![
+            format!(
+                "scattering: binary {} + {} (a = 1, e = {}) hit by star of mass {}",
+                m[0],
+                m[1],
+                if ecc < 0.0 { "thermal".to_string() } else { format!("{ecc}") },
+                m[2]
+            ),
+            "x: speed at infinity v/vc 0 to 3 (line = vc, hard | soft)   y: pericentre rp/a 0 (bottom) to 4".into(),
+            if settings.color_mode == ColorMode::EjectionTime {
+                "colour: binary binding-energy change (green hardened, magenta softened)".into()
+            } else {
+                "colour: blue flyby  gold exchange  red ionisation  dark unresolved".into()
+            },
+            format!(
+                "{} encounters, {:.0}/s ({}x{} cells x {} running each)",
+                table.total,
+                table.rate,
+                SCATTER_CELLS,
+                SCATTER_CELLS,
+                crate::params::SCATTER_SAMPLES
+            ),
+        ];
+        if let Some(texel) = cursor_texel(&window, display.0) {
+            let c = texel_cell(texel);
+            let (v, rp) = Settings::cell_params(c);
+            if let Some(cell) = table.cell(c) {
+                lines.push(format!("cell v/vc {v:.2}, rp/a {rp:.2}: {}", cell.describe()));
+                lines.push(format!("all rp at v/vc {v:.2}: {}", table.column(c.x).describe()));
+            }
+        }
+        if let Some(traj) = &inspector.current {
+            lines.push(describe(traj));
+        }
+        if let Some(report) = &scatter_verify.report {
+            lines.push(report.clone());
+        }
+        status.0 = lines.join("\n");
+        return;
+    }
 
     let p = &settings.physics;
     let mut lines = vec![

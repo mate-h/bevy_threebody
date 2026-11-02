@@ -5,6 +5,7 @@ mod input;
 mod inspector;
 mod params;
 mod render;
+mod scatter;
 mod stats;
 mod ui;
 
@@ -42,11 +43,16 @@ fn main() {
         .init_resource::<SimState>()
         .init_resource::<stats::GpuStats>()
         .init_resource::<stats::Verify>()
+        .init_resource::<scatter::ScatterTable>()
+        .init_resource::<scatter::ScatterVerify>()
         .init_resource::<input::DisplaySize>()
         .init_resource::<input::DragState>()
         .init_resource::<input::AutoZoom>()
         .init_resource::<inspector::Inspector>()
-        .add_systems(Startup, (setup, ui::setup_ui, stats::spawn_readback).chain())
+        .add_systems(
+            Startup,
+            (setup, ui::setup_ui, stats::spawn_readback, scatter::spawn_readback).chain(),
+        )
         .add_systems(
             Update,
             (
@@ -58,6 +64,7 @@ fn main() {
                 stats::advance_levels,
                 stats::tune_step_budget,
                 (stats::start_verify, stats::finish_verify),
+                (scatter::track_rate, scatter::start_verify, scatter::finish_verify),
                 (inspector::handle_requests, inspector::poll_task, inspector::draw).chain(),
                 show_front_image,
                 ui::update_ui,
@@ -111,6 +118,8 @@ fn show_front_image(
 
 /// Command-line automation for unattended runs:
 ///   --mode N (1-5)  --masses N (0-2)  --sensitivity  --tour
+///   --scatter       start in the scattering table   --ecc N (0-3) its eccentricity preset
+///   --shot-after S  screenshot (and verify) after S seconds instead of on completion
 ///   --shot PREFIX   save a screenshot whenever an image completes
 ///   --verify        compare GPU fates against the CPU when an image completes
 ///   --exit          quit once everything requested is done
@@ -123,6 +132,10 @@ struct Autopilot {
     shot: Option<String>,
     verify: bool,
     exit: bool,
+    scatter: bool,
+    ecc: Option<usize>,
+    shot_after: Option<f64>,
+    timed_done: bool,
     handled_generation: Option<u32>,
     tour_started: bool,
     exit_at: Option<f64>,
@@ -141,6 +154,9 @@ impl Autopilot {
                 "--shot" => a.shot = args.next(),
                 "--verify" => a.verify = true,
                 "--exit" => a.exit = true,
+                "--scatter" => a.scatter = true,
+                "--ecc" => a.ecc = args.next().and_then(|v| v.parse().ok()),
+                "--shot-after" => a.shot_after = args.next().and_then(|v| v.parse().ok()),
                 other => warn!("unknown argument {other}"),
             }
         }
@@ -154,6 +170,12 @@ impl Autopilot {
             s.mass_preset = m.min(params::MASS_PRESETS.len() - 1);
         }
         s.sensitivity = self.sensitivity;
+        if self.scatter {
+            s.mode = params::SimMode::Scattering;
+        }
+        if let Some(e) = self.ecc {
+            s.ecc_preset = e.min(params::ECC_PRESETS.len() - 1);
+        }
         s.color_mode = match self.mode {
             Some(2) => EjectionTime,
             Some(3) => EnergyError,
@@ -174,6 +196,7 @@ fn run_autopilot(
     sim: Res<SimState>,
     settings: Res<Settings>,
     mut verify: ResMut<stats::Verify>,
+    mut scatter_verify: ResMut<scatter::ScatterVerify>,
     mut auto: ResMut<input::AutoZoom>,
     time: Res<Time<Real>>,
     mut exit: MessageWriter<AppExit>,
@@ -186,6 +209,28 @@ fn run_autopilot(
             steps_left: input::TOUR_STEPS,
             wait_until: f64::INFINITY,
         };
+    }
+    if let Some(after) = autopilot.shot_after {
+        if !autopilot.timed_done && now >= after {
+            autopilot.timed_done = true;
+            if let Some(prefix) = &autopilot.shot {
+                let path = format!("{prefix}-{after:.0}s.png");
+                info!("saving screenshot {path}");
+                commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
+            }
+            if autopilot.verify {
+                scatter_verify.pending = settings.scattering();
+                verify.pending = !settings.scattering();
+            }
+        }
+        let verified = !autopilot.verify || scatter_verify.report.is_some() || verify.report.is_some();
+        if autopilot.exit && autopilot.timed_done && verified {
+            let at = *autopilot.exit_at.get_or_insert(now + 1.5);
+            if now >= at {
+                exit.write(AppExit::Success);
+            }
+        }
+        return;
     }
     if sim.done && autopilot.handled_generation != Some(sim.generation) {
         autopilot.handled_generation = Some(sim.generation);

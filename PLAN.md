@@ -1,7 +1,7 @@
 # Plan: Three-Body Ejection Fractal — Bevy 0.20 + WGSL compute
 
 Goal: reproduce the "fate map" from Popperish's *We Threw Three Stars Together 5 Million
-Times* (see `transcript.md`) as a real-time, zoomable fractal.
+Times* (https://www.youtube.com/watch?v=gvSyJ3kQSHU) as a real-time, zoomable fractal.
 
 ## 1. What the video actually computes
 

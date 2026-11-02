@@ -15,6 +15,15 @@ pub const LEVELS: [u32; 3] = [256, 512, 1024];
 /// Half-width of the default view in world units.
 pub const DEFAULT_HALF_WIDTH: f64 = 3.0;
 
+/// Scattering table: cells per side, encounters running per cell (cells^2 * samples must
+/// equal TEX_SIZE^2, one system per finest-level pixel), and axis ranges.
+pub const SCATTER_CELLS: u32 = 128;
+pub const SCATTER_SAMPLES: u32 = 64;
+pub const SCATTER_V_MAX: f64 = 3.0;
+pub const SCATTER_RP_MAX: f64 = 4.0;
+/// Binary eccentricity presets; negative = thermal distribution.
+pub const ECC_PRESETS: [f64; 4] = [0.0, 0.5, 0.9, -1.0];
+
 /// Mirrors `struct Params` in `assets/shaders/threebody.wgsl` (same field order).
 #[derive(Clone, Copy, Debug, Default, ShaderType)]
 pub struct GpuParams {
@@ -39,6 +48,13 @@ pub struct GpuParams {
     pub sensitivity: u32,
     pub front: u32,
     pub done: u32,
+    pub mode: u32,
+    pub scatter_ecc: f32,
+    pub cells: u32,
+    pub samples: u32,
+    pub v_max: f32,
+    pub rp_max: f32,
+    pub seed_base: u32,
 }
 
 /// What the render world sees each frame.
@@ -67,6 +83,14 @@ impl ColorMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimMode {
+    /// Every pixel: three stars from rest, coloured by which is ejected.
+    FateMap,
+    /// Every cell: random binary-single encounters, coloured by outcome probabilities.
+    Scattering,
+}
+
 /// Mass presets from the video: equal, 3-4-5 and 1-2-3.
 pub const MASS_PRESETS: [[f64; 3]; 3] = [[1.0, 1.0, 1.0], [3.0, 4.0, 5.0], [1.0, 2.0, 3.0]];
 
@@ -81,6 +105,8 @@ pub struct Settings {
     pub eta_b_ratio: f64,
     pub sensitivity: bool,
     pub color_mode: ColorMode,
+    pub mode: SimMode,
+    pub ecc_preset: usize,
 }
 
 impl Default for Settings {
@@ -93,6 +119,8 @@ impl Default for Settings {
             eta_b_ratio: 0.5,
             sensitivity: false,
             color_mode: ColorMode::Fate,
+            mode: SimMode::FateMap,
+            ecc_preset: 0,
         }
     }
 }
@@ -117,8 +145,29 @@ impl Settings {
     }
 
     /// Settings whose change invalidates every pixel.
-    fn sim_key(&self) -> (DVec2, f64, Config, bool, f64) {
-        (self.center, self.half_width, self.physics, self.sensitivity, self.eta_b_ratio)
+    fn sim_key(&self) -> (DVec2, f64, Config, bool, f64, SimMode, usize) {
+        (
+            self.center,
+            self.half_width,
+            self.physics,
+            self.sensitivity && self.mode == SimMode::FateMap,
+            self.eta_b_ratio,
+            self.mode,
+            self.ecc_preset,
+        )
+    }
+
+    pub fn scattering(&self) -> bool {
+        self.mode == SimMode::Scattering
+    }
+
+    /// (v_inf / v_c, r_p / a) at the centre of scattering cell `c` (row 0 at the top).
+    pub fn cell_params(c: UVec2) -> (f64, f64) {
+        let n = SCATTER_CELLS as f64;
+        (
+            (c.x as f64 + 0.5) / n * SCATTER_V_MAX,
+            (n - c.y as f64 - 0.5) / n * SCATTER_RP_MAX,
+        )
     }
 
     /// World position of a texel coordinate (0..TEX_SIZE, y down).
@@ -219,7 +268,8 @@ pub fn commit_settings(
         (sim.prev_center, sim.prev_scale) = (prev.center, prev.scale());
         sim.generation = sim.generation.wrapping_add(1);
         sim.front ^= 1;
-        sim.level = 0;
+        // The scattering table runs one system per finest-level pixel from the start.
+        sim.level = if settings.scattering() { LEVELS.len() - 1 } else { 0 };
         sim.done = false;
         sim.generation_started = now;
         sim.level_started = now;
@@ -257,8 +307,15 @@ pub fn commit_settings(
             ColorMode::Steps => 3,
             ColorMode::Sensitivity => 4,
         },
-        sensitivity: settings.sensitivity as u32,
+        sensitivity: (settings.sensitivity && !settings.scattering()) as u32,
         front: sim.front,
         done: sim.done as u32,
+        mode: settings.scattering() as u32,
+        scatter_ecc: ECC_PRESETS[settings.ecc_preset] as f32,
+        cells: SCATTER_CELLS,
+        samples: SCATTER_SAMPLES,
+        v_max: SCATTER_V_MAX as f32,
+        rp_max: SCATTER_RP_MAX as f32,
+        seed_base: sim.generation.wrapping_mul(0x9e37_79b9),
     };
 }

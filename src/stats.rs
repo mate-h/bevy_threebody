@@ -63,8 +63,12 @@ pub fn spawn_readback(mut commands: Commands, targets: Res<FractalTargets>) {
 pub fn advance_levels(
     mut sim: ResMut<SimState>,
     mut stats: ResMut<GpuStats>,
+    settings: Res<Settings>,
     time: Res<Time<Real>>,
 ) {
+    if settings.scattering() {
+        return;
+    }
     if stats.valid && (stats.generation != sim.generation || stats.level != sim.level as u32) {
         stats.valid = false;
     }

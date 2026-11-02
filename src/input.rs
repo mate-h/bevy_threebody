@@ -11,6 +11,8 @@ use bevy::{
 use crate::params::{ColorMode, DEFAULT_HALF_WIDTH, MASS_PRESETS, Settings, SimState, TEX_SIZE};
 use crate::stats::{GRID, GpuStats, Verify};
 use crate::inspector::InspectRequest;
+use crate::params::{ECC_PRESETS, SCATTER_CELLS, SimMode};
+use crate::scatter::ScatterVerify;
 
 /// The sprite showing the fractal; sized to fit the window.
 #[derive(Component)]
@@ -74,6 +76,16 @@ pub fn mouse_controls(
 ) {
     let texel = cursor_texel(&window, display.0);
 
+    if settings.scattering() {
+        // The table has fixed axes; right-click replays one encounter of the cell.
+        if buttons.just_pressed(MouseButton::Right) {
+            if let Some(texel) = texel {
+                inspect.write(InspectRequest::Encounter(texel_cell(texel)));
+            }
+        }
+        return;
+    }
+
     // Wheel: zoom about the cursor.
     let lines = match scroll.unit {
         MouseScrollUnit::Line => scroll.delta.y,
@@ -111,7 +123,7 @@ pub fn mouse_controls(
     // Right click: trajectory inspector.
     if buttons.just_pressed(MouseButton::Right) {
         if let Some(texel) = texel {
-            inspect.write(InspectRequest(Some(settings.texel_to_world(texel))));
+            inspect.write(InspectRequest::Point(settings.texel_to_world(texel)));
         }
     }
 }
@@ -121,6 +133,7 @@ pub fn keyboard_controls(
     mut settings: ResMut<Settings>,
     mut auto: ResMut<AutoZoom>,
     mut verify: ResMut<Verify>,
+    mut scatter_verify: ResMut<ScatterVerify>,
     mut inspect: MessageWriter<InspectRequest>,
     mut help: ResMut<crate::ui::ShowHelp>,
     mut commands: Commands,
@@ -142,7 +155,23 @@ pub fn keyboard_controls(
             }
         }
     }
-    if keys.just_pressed(KeyCode::KeyS) {
+    if keys.just_pressed(KeyCode::Tab) {
+        settings.mode = match settings.mode {
+            SimMode::FateMap => SimMode::Scattering,
+            SimMode::Scattering => SimMode::FateMap,
+        };
+        settings.color_mode = ColorMode::Fate;
+        auto.active = false;
+        inspect.write(InspectRequest::Close);
+    }
+    if keys.just_pressed(KeyCode::KeyE) {
+        settings.ecc_preset = (settings.ecc_preset + 1) % ECC_PRESETS.len();
+    }
+    let scattering = settings.scattering();
+    if scattering && !matches!(settings.color_mode, ColorMode::Fate | ColorMode::EjectionTime) {
+        settings.color_mode = ColorMode::Fate;
+    }
+    if keys.just_pressed(KeyCode::KeyS) && !scattering {
         settings.sensitivity = !settings.sensitivity;
         if !settings.sensitivity && settings.color_mode == ColorMode::Sensitivity {
             settings.color_mode = ColorMode::Fate;
@@ -169,15 +198,15 @@ pub fn keyboard_controls(
     if keys.just_pressed(KeyCode::Equal) {
         settings.physics.t_max_cr = (settings.physics.t_max_cr * 1.5).min(2000.0);
     }
-    if keys.just_pressed(KeyCode::Space) {
+    if keys.just_pressed(KeyCode::Space) && !scattering {
         zoom_into_boundary(&mut settings, &stats, &sim);
         auto.active = false;
     }
-    if keys.just_pressed(KeyCode::Backspace) {
+    if keys.just_pressed(KeyCode::Backspace) && !scattering {
         settings.half_width = (settings.half_width * ZOOM_STEP).min(DEFAULT_HALF_WIDTH * 4.0);
         auto.active = false;
     }
-    if keys.just_pressed(KeyCode::KeyT) {
+    if keys.just_pressed(KeyCode::KeyT) && !scattering {
         if auto.active {
             auto.active = false;
         } else {
@@ -192,10 +221,14 @@ pub fn keyboard_controls(
         }
     }
     if keys.just_pressed(KeyCode::KeyV) {
-        verify.pending = true;
+        if scattering {
+            scatter_verify.pending = true;
+        } else {
+            verify.pending = true;
+        }
     }
     if keys.just_pressed(KeyCode::Escape) {
-        inspect.write(InspectRequest(None));
+        inspect.write(InspectRequest::Close);
     }
     if keys.just_pressed(KeyCode::KeyH) {
         help.0 = !help.0;
@@ -205,6 +238,13 @@ pub fn keyboard_controls(
         info!("saving screenshot {path}");
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
     }
+}
+
+/// Scattering-table cell under a texel.
+pub fn texel_cell(texel: Vec2) -> UVec2 {
+    (texel / (TEX_SIZE / SCATTER_CELLS) as f32)
+        .as_uvec2()
+        .min(UVec2::splat(SCATTER_CELLS - 1))
 }
 
 /// Picks a 64x64 stats cell on a basin boundary (fates mixed, with an almost single-colour
