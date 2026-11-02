@@ -2,6 +2,8 @@
 name = "bevy_threebody"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mate-h/bevy_threebody"
 
 [dependencies]
 bevy = "0.20.1"

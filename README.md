@@ -122,3 +122,12 @@ Code:
 
 - [Bevy](https://bevyengine.org) 0.20. The render-world plumbing follows its `compute_shader_game_of_life` and `gpu_readback` examples.
 - The viridis polynomial fit in the shader is by Matt Zucker (CC0).
+
+## License
+
+Dual-licensed under either of
+
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option, the same as Bevy.
